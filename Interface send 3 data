@@ -77,7 +77,7 @@ typedef enum { ADS_DUMMY, ADS_CH0, ADS_CH1, ADS_IDLE } ADS_State; //DMA
 #define consecutiveCount 200			//Consecutive count error to trigger fault
 #define SENSOR_SENSITIVITY 0.006f		//Current Sensor Sensitivity for read up to 300A
 #define CURRENT_OFFSET 0.0f				//Offset for Read the Current (Regression for ADS8684)
-#define default_interval 20				//Interval 10 ms for ADS8684 Read
+#define default_interval 8			//Interval 10 ms for ADS8684 Read
 #define CURRENT_GAIN_FACTOR 0.93f
 #define EMA_ALPHA 0.1f
 #define UART_TX_BUF_SIZE 2000
@@ -151,6 +151,10 @@ float maxVoltage[4];
 float avgVoltage[4];
 uint8_t VtotalData[5];
 uint8_t CurrentData[3];
+uint8_t TempA[2];
+uint8_t TempB[2];
+uint8_t TotalTempA;  //Biar enak a sama b dibedain
+uint8_t TotalTempB;
 
 int millivolt;
 char snum[7];
@@ -187,8 +191,8 @@ uint32_t tx_time8 = 0;
 //uint8_t MinVoltageData[5];
 //uint8_t MaxVoltageData[5];
 uint8_t AvgVoltageData[5];
-//uint8_t avgTempData[5];
-//uint8_t avgTempDataB[5];
+uint8_t avgTempData[5];
+uint8_t avgTempDataB[5];
 //uint8_t CurrentData[3];
 
 volatile uint8_t receive_current_vcu[2];
@@ -989,9 +993,9 @@ void current_calc(void){
 
 		diff_voltage = (volt_ch0 - volt_ch1) - dynamic_voltage_offset;
 
-//		if(diff_voltage > -0.01f && diff_voltage < 0.01f){
-//			diff_voltage = 0.0f;
-//		}
+		if(diff_voltage > -0.001f && diff_voltage < 0.001f){
+			diff_voltage = 0.0f;
+		}
 
 		current[0] = (-156.01 * diff_voltage) + 0.653; //Hasil Regresi Linear
 
@@ -1344,11 +1348,12 @@ void filterTemp(void){
 
 
 uint8_t CANTransmitTemp(void){
-	uint8_t avgTempData[5];
-	avgTempData[0] = 0x07;
+	TempA[0] = 0x07;
 	for (int i=1; i < 5; i++){
 		avgTempData[i] = (uint8_t)((int)fabs(avgTemp[i]));
 	}
+	TotalTempA = avgTempData[1] + avgTempData[2] + avgTempData[3] + avgTempData[4];
+	TempB[1] = TotalTempA;
 	CAN_TxHeaderTypeDef TxHeader;
 	uint32_t TxMailbox;
 
@@ -1356,7 +1361,7 @@ uint8_t CANTransmitTemp(void){
 	TxHeader.ExtId = 0;
 	TxHeader.IDE = CAN_ID_STD;
 	TxHeader.RTR = CAN_RTR_DATA;
-	TxHeader.DLC = 8;
+	TxHeader.DLC = 2;
 
 	//CAN Transmit for Average Temp each module
 //	HAL_CAN_AddTxMessage(&hcan2, &TxHeader, avgTempData, &TxMailbox);
@@ -1365,7 +1370,7 @@ uint8_t CANTransmitTemp(void){
 	return 0;
 	}
 
-	if (HAL_CAN_AddTxMessage(&hcan2, &TxHeader, avgTempData, &TxMailbox) == HAL_OK) {
+	if (HAL_CAN_AddTxMessage(&hcan2, &TxHeader, TempA, &TxMailbox) == HAL_OK) {
 
 	return 1;
 	}
@@ -1375,12 +1380,13 @@ uint8_t CANTransmitTemp(void){
 
 
 uint8_t CANTransmitTempB(void){
-	uint8_t avgTempDataB[5];
-	avgTempDataB[0] = 0x08;
+	TempB[0] = 0x08;
 
 	for (int i=1; i < 5; i++){
 		avgTempDataB[i] = (uint8_t)((int)fabs(avgTemp[i+4]));
 	}
+	TotalTempB = avgTempDataB[1] + avgTempDataB[2] + avgTempDataB[3] + avgTempDataB[4];
+	TempB[1] = TotalTempB;
 	CAN_TxHeaderTypeDef TxHeader;
 	uint32_t TxMailbox;
 
@@ -1388,11 +1394,11 @@ uint8_t CANTransmitTempB(void){
 	TxHeader.ExtId = 0;
 	TxHeader.IDE = CAN_ID_STD;
 	TxHeader.RTR = CAN_RTR_DATA;
-	TxHeader.DLC = 5;
+	TxHeader.DLC = 2;
 
 //	HAL_CAN_AddTxMessage(&hcan2, &TxHeader, avgTempDataB, &TxMailbox);
 
-	if (HAL_CAN_AddTxMessage(&hcan2, &TxHeader, avgTempDataB, &TxMailbox) == HAL_OK) {
+	if (HAL_CAN_AddTxMessage(&hcan2, &TxHeader, TempB, &TxMailbox) == HAL_OK) {
 
 	return 1;
 	}
