@@ -1,0 +1,1887 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2025 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "adc.h"
+#include "can.h"
+#include "dma.h"
+#include "i2c.h"
+#include "spi.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "ADS8684.h"
+#include "ad7280a_stm32.h"
+#include "ADS1015_ADS1115.h"
+#include "main.h"
+#include "math.h"
+#include "string.h"
+#include "eeprom.h"
+#include "stdlib.h"
+#include "stdio.h"
+#include "stdarg.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+typedef enum { ADS_DUMMY, ADS_CH0, ADS_CH1, ADS_IDLE } ADS_State; //DMA
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+#define Vth 0.025						//Battery voltage treshold in percentage of battery average voltage to detect cell that have to be in balancing state (charging mode)
+#define Vth_CB 0.05
+#define Vhigh 4150						//treshold for maximum battery voltage per cell
+#define Vlow 2800						//treshold for minimum battery voltage per cell
+#define Vth_high 4000
+#define Vth_low 2800
+#define TempHigh 55						//treshold for maximum temperature
+#define CTh 0.1							//Current treshold in percentage of battery capacity to detect in idle, charge or discharge condition
+#define packCapacity 24					//Battery Capacity in Ah
+#define discharge_current_limit	-300	//Discharge current limit in Ampere
+#define charge_current_limit 8			//Charging Current limit in Ampere
+#define THERMISTORNOMINAL 10000			//Resistance of thermistor
+#define TEMPERATURENOMINAL 25			//Normal Temp in degree celcius
+#define BCOEFFICIENT 3974
+#define SERIESRESISTOR 10000			//Resistor for Vdivider NTC Configuration
+#define consecutiveCount 200			//Consecutive count error to trigger fault
+#define SENSOR_SENSITIVITY 0.006f		//Current Sensor Sensitivity for read up to 300A
+#define CURRENT_OFFSET 0.0f				//Offset for Read the Current (Regression for ADS8684)
+#define default_interval 20				//Interval 10 ms for ADS8684 Read
+#define CURRENT_GAIN_FACTOR 0.93f
+#define EMA_ALPHA 0.1f
+#define UART_TX_BUF_SIZE 2000
+
+ADS8684 ads;
+uint16_t ads_raw_buffer[4];				//4 input channel of ADS8684
+float volt_ch0 = 0;						//Ouput current sensor -> input ADS8684 ch0
+float volt_ch1 = 0;						//Vref 2.5V of current sensor -> input ADS8684 ch1
+uint32_t current_tick = 0;
+uint32_t previous_tick = 0;
+uint16_t ads_tx[2];
+uint16_t ads_rx[2];
+volatile ADS_State ads_state = ADS_IDLE;
+volatile uint8_t   ads_complete = 0;
+
+
+float thermistor_resistance[BATTERY_SERIES_CON];
+uint8_t SPI_Ready = 1, SPI_TX = 1, SPI_RX = 1;
+uint8_t readBattery = 1;
+uint16_t ADC_Val = 0;
+uint32_t ADC_Val_Ref = 0;
+float vRef;
+uint16_t sample_num;
+float Vtotal = 0.0f;
+uint32_t VtotalMV = 0;
+float out[3]={0,0,0}, in[3]={0,0,0};
+float ADC_Filtered;
+float current[2], mAh, Ah, accumulator;
+uint16_t capacity = 16200;
+float vADC;
+
+
+
+float Vmax, Vmin, Vavg, Vtresh;
+uint8_t Cell_balancer[BATTERY_SERIES_CON], CB[BATTERY_SERIES_CON/6][12], lastCB [BATTERY_SERIES_CON/6][12], packState=0, lastPackState=0,CBChange;
+uint8_t packUnbalanced=0, lastPackUnbalanced = 0;
+uint8_t fully_discharged = 0, last_fully_discharged = 0, fully_charged = 0;
+
+extern float cellVoltage[BATTERY_SERIES_CON];
+extern float auxADC[BATTERY_SERIES_CON];
+float temperature[BATTERY_SERIES_CON];
+
+float VarDataCap = 0;
+uint16_t VarValue, VarDataTmp = 0;
+
+uint8_t startUp;
+uint16_t telo1, telo2;
+char textBuf [511];
+
+uint8_t DschCtrl, ChCtrl;
+uint8_t DisCtrl, CharCtrl;
+uint8_t uv_stat, ov_stat;
+uint8_t ot_stat;
+uint8_t fault1, faultChar, faultall;
+uint16_t kampret;
+
+uint16_t fault0;
+
+ADS1xx5_I2C i2c;
+int16_t adc1;
+
+volatile uint8_t tempData [24][8];
+uint8_t tempDataInt [24][8];
+
+
+float tempMin[8];
+float tempMax[8];
+float avgTemp[8];
+float minVoltage[4];
+float maxVoltage[4];
+float avgVoltage[4];
+uint8_t VtotalData[5];
+uint8_t CurrentData[3];
+
+int millivolt;
+char snum[7];
+float dynamic_voltage_offset = 0.0f;
+float filtered_diff_voltage = 0.0f;
+float diff_voltage = 0.0f;
+
+volatile uint8_t send_current_data = 0;
+volatile uint8_t send_temp_data = 0;
+volatile uint8_t send_tempB_data = 0;
+volatile uint8_t send_avgvoltage_data = 0;
+volatile uint8_t send_minvoltage_data = 0;
+volatile uint8_t send_maxvoltage_data = 0;
+volatile uint8_t send_vtotal_data = 0;
+
+uint32_t last1;
+uint32_t last2;
+uint32_t last3;
+uint32_t last4;
+uint32_t last5;
+uint32_t last6;
+uint32_t last7;
+
+uint32_t tx_time = 0;
+uint32_t tx_time1 = 0;
+uint32_t tx_time2 = 0;
+uint32_t tx_time3 = 0;
+uint32_t tx_time4 = 0;
+uint32_t tx_time5 = 0;
+uint32_t tx_time6 = 0;
+uint32_t tx_time7 = 0;
+uint32_t tx_time8 = 0;
+
+//uint8_t MinVoltageData[5];
+//uint8_t MaxVoltageData[5];
+uint8_t AvgVoltageData[5];
+//uint8_t avgTempData[5];
+//uint8_t avgTempDataB[5];
+//uint8_t CurrentData[3];
+
+volatile uint8_t receive_current_vcu[2];
+volatile uint8_t receive_temp_vcu[2];
+volatile uint8_t receive_avgVoltageA_vcu[2];
+volatile uint8_t receive_avgVoltageB_vcu[2];
+volatile uint8_t receive_minmaxVoltageA_vcu[2];
+volatile uint8_t receive_minmaxVoltageB_vcu[2];
+volatile uint8_t receive_VtotalMV_vcu[2];
+
+uint8_t CobaData[3];
+
+char dma_tx_buffer[UART_TX_BUF_SIZE];
+volatile uint8_t dma_tx_ready = 1;
+static uint8_t print_sequence = 0;
+//int 									millivolt;
+//char 									snum[7];  // Sufficient space for millivolt values (-4096 to 4096)
+
+
+int __io_putchar(int ch) {
+    HAL_UART_Transmit(&huart5, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+    return ch;
+}
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+/* USER CODE BEGIN PFP */
+void Get_ADC_Value(void);
+//void LPF_current_sensor(void);
+//void ReadADS1115(void);
+void current_calc(void);
+void chargingMode(void);
+void calcUV(void);
+void calcOV(void);
+void calcVtotal(void);
+void calcVtotalMV(void); //BARUU
+void calcVBatCond(void);
+void faultDet(void);
+void faultTotal(void);
+//void DataCurrent(void);
+//void DataTempA(void);
+//void DataTempB(void);
+//void DataMinVoltage(void);
+//void DataMaxVoltage(void);
+void DataAvgVoltage(void);
+uint8_t CANTransmitTemp(void);
+uint8_t CANTransmitTempB(void);
+uint8_t CANTransmitMinVoltage(void);
+uint8_t CANTransmitMaxVoltage(void);
+uint8_t CANTransmitAvgVoltage(void);
+uint8_t CANTransmitCurrent(void);
+uint8_t CANTransmitVtotalMV(void);
+void SendCANBMS(void);
+//void CANTransmitCoba();
+//void CANTransmitCharger(void);
+void filterTemp(void);
+void filterVoltage(void);
+void printCurrentData(void);
+void printCVData(void);
+void printTemp(void);
+
+void printCVData_DMA(void);
+void printTempData_DMA(void);
+void printCurrentData_DMA(void);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+uint32_t millis(){
+	return HAL_GetTick();
+}
+
+void SendCANBMS(void)
+
+{
+
+    static uint8_t txIndex = 0;
+
+
+
+    if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan2) == 0) {
+
+        return;
+
+    }
+
+
+
+    for (int attempt = 0; attempt < 3; attempt++)
+
+    {
+
+        switch (txIndex)
+
+        {
+
+//            case 0:
+//
+//                txIndex = 1;
+//
+////                if (send_avgvoltage_data == 1 && HAL_GetTick() - last4 >= 30) {
+////
+////                    if (CANTransmitAvgVoltage()) {
+////
+////                        last4 = HAL_GetTick();
+////
+////                    }
+////
+////                    return;
+////
+////                }
+//
+//                break;
+
+
+
+//            case 1:
+//
+//                txIndex = 2;
+//
+////                if (send_current_data == 1 && HAL_GetTick() - last1 >= 50) {
+////
+////                    if (CANTransmitCurrent()) {
+////
+////                        last1 = HAL_GetTick();
+////
+////                    }
+////
+////                    return;
+////
+////                }
+//
+//                break;
+
+
+
+            case 1:
+
+                txIndex = 1;
+
+                if (send_temp_data == 1 && HAL_GetTick() - last2 >= 10) {
+
+                    if (CANTransmitTemp()) {
+
+                        last2 = HAL_GetTick();
+
+                    }
+
+                    return;
+
+                }
+
+                break;
+
+
+
+            case 2:
+
+                txIndex = 2;
+
+                if (send_tempB_data == 1 && HAL_GetTick() - last3 >= 20) {
+
+                    if (CANTransmitTempB()) {
+
+                        last3 = HAL_GetTick();
+
+                    }
+
+                    return;
+
+                }
+
+                break;
+
+
+
+//            case 4:
+//
+//                txIndex = 5;
+//
+////                if (send_minvoltage_data == 1 && HAL_GetTick() - last5 >= 90) {
+////
+////                    if (CANTransmitMinVoltage()) {
+////
+////                        last5 = HAL_GetTick();
+////
+////                    }
+////
+////                    return;
+////
+////                }
+//
+//                break;
+
+
+
+//            case 5:
+//
+//                txIndex = 6;
+//
+////                if (send_maxvoltage_data == 1 && HAL_GetTick() - last6 >= 105) {
+////
+////                    if (CANTransmitMaxVoltage()) {
+////
+////                        last6 = HAL_GetTick();
+////
+////                    }
+////
+////                    return;
+////
+////                }
+//
+//                break;
+
+            case 3:
+                txIndex = 0;
+
+                if(send_vtotal_data == 1 && HAL_GetTick() - last7 >= 80){
+                   if(CANTransmitVtotalMV()){
+                      last7 = HAL_GetTick();
+                   }
+                      return;
+                   }
+                      break;
+
+        }
+
+    }
+
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_ADC1_Init();
+  MX_CAN1_Init();
+  MX_CAN2_Init();
+  MX_SPI1_Init();
+  MX_I2C3_Init();
+  MX_UART5_Init();
+  MX_SPI3_Init();
+  MX_TIM3_Init();
+  MX_TIM9_Init();
+  /* USER CODE BEGIN 2 */
+
+  CAN_FilterTypeDef canFilterConfig;
+
+  canFilterConfig.FilterBank = 0;  // Use filter bank 0 for standard IDs
+  canFilterConfig.FilterMode = CAN_FILTERMODE_IDMASK;
+  canFilterConfig.FilterScale = CAN_FILTERSCALE_32BIT;  // Standard ID uses 16-bit scale
+  canFilterConfig.FilterIdHigh = 0x0000;
+  canFilterConfig.FilterIdLow = 0x0000; // Standard ID is left-shifted by 5 bits
+  canFilterConfig.FilterMaskIdHigh = 0x0000;  // Mask for range 0x18 - 0x41
+  canFilterConfig.FilterMaskIdLow = 0x0000;
+  canFilterConfig.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+  canFilterConfig.FilterActivation = ENABLE;
+  canFilterConfig.SlaveStartFilterBank = 14;
+
+  HAL_CAN_ConfigFilter(&hcan1, &canFilterConfig);
+
+  CAN_FilterTypeDef filter2;
+
+  filter2.FilterActivation = ENABLE;
+  filter2.FilterBank = 14;
+  filter2.FilterFIFOAssignment = CAN_FILTER_FIFO1;
+  filter2.FilterMode = CAN_FILTERMODE_IDMASK;
+  filter2.FilterScale = CAN_FILTERSCALE_32BIT;
+
+  filter2.FilterIdHigh = (0x03 << 5);
+  filter2.FilterIdLow = 0;
+
+  filter2.FilterMaskIdHigh = (0x7FF << 5);
+  filter2.FilterMaskIdLow = 0;
+
+  filter2.SlaveStartFilterBank = 14;
+
+  HAL_CAN_ConfigFilter(&hcan2, &filter2);
+
+    HAL_CAN_Start (&hcan1); //CAN 1 using FIFO0
+      HAL_CAN_ActivateNotification(&hcan1,
+    		  CAN_IT_RX_FIFO0_MSG_PENDING |
+    		  CAN_IT_TX_MAILBOX_EMPTY);
+
+      HAL_CAN_Start(&hcan2); //CAN 2 using FIFO0
+      HAL_CAN_ActivateNotification(&hcan2,
+     		  CAN_IT_RX_FIFO1_MSG_PENDING |
+     		  CAN_IT_TX_MAILBOX_EMPTY);
+
+  accumulator = capacity;
+  AD7280A_Init();
+
+  //Reset the ADS8684 first when init conditioon
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);
+  HAL_Delay(10);
+    // Tarik RST kembali ke HIGH agar chip bangun dan referensi 4.096V aktif
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);
+  HAL_Delay(10); // Delay for internal circuit to reach stable condition
+    // Make sure CS is high (PB4) before initial -> CS will pull into low to start SPI Communication
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_SET);
+  ADS8684_Init(&ads, &hspi3, GPIOB, GPIO_PIN_4);
+  float sum_diff_voltage = 0;
+    int cal_samples = 100; // Ambil 100 sampel data
+
+    // Lakukan pembacaan 100 kali untuk mencari rata-rata tegangan saat 0A
+    for(int i = 0; i < cal_samples; i++) {
+        if(ADS_Read_All_Raw(&ads, ads_raw_buffer) == HAL_OK) {
+            float v0 = ((float)ads_raw_buffer[0] * 5.12f) / 65535.0f;
+            float v1 = ((float)ads_raw_buffer[1] * 5.12f) / 65535.0f;
+            sum_diff_voltage += (v0 - v1);
+        }
+        HAL_Delay(1); // Jeda kecil antar sampel
+    }
+
+    // Simpan hasil rata-rata sebagai offset permanen selama sistem menyala
+    dynamic_voltage_offset = sum_diff_voltage / cal_samples;
+
+//    ads_state    = ADS_DUMMY;
+//    ads_complete = 0;
+//    ads_tx[0] = MAN_0;
+//    ads_tx[1] = 0x0000;
+//    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_RESET);
+//    HAL_SPI_TransmitReceive_DMA(&hspi3, (uint8_t*)ads_tx,(uint8_t*)ads_rx, 2);
+
+
+  HAL_TIM_Base_Start_IT(&htim3);
+  HAL_TIM_Base_Start_IT(&htim9);
+  startUp = 1;
+  ADS1115(&i2c, &hi2c3, ADS_ADDR_GND);
+  ADSsetGain(&i2c, GAIN_ONE);
+
+//  for(int i = 0; i < 20; i++){
+//	  Get_ADC_Value();
+//	  ADC_Val_Ref = ADC_Val_Ref + ADC_Val;
+//  }
+//  vRef = ((ADC_Val_Ref/20) / 4095) * 3.3;
+//
+//  if (vRef < 2.6 && vRef > 2.4){
+//	  vRef = vRef;
+//  }
+//  else{
+//	  vRef = 2.5;
+//  }
+
+  for (int i = 0; i < 24; i++){
+	  for (int j = 0; j < 8; j++){
+		  tempData [i][j] = 0;
+	  }
+  }
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+  while (1)
+  {
+	  if(readBattery == 1){
+		  AD7280A_Convert_Read_All(BATTERY_SERIES_CON);
+
+		  HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET);
+
+		  Vtotal = 0;
+		  calcVtotal();
+		  calcVtotalMV();
+		  current_calc();
+          if (send_current_data == 1 && HAL_GetTick() - last1 >= 100) {
+
+              if (CANTransmitCurrent()) {
+
+                  last1 = HAL_GetTick();
+
+              }
+
+          }
+		  calcVBatCond();
+		  calcUV();
+		  calcOV();
+		  faultDet();
+//		  faultDetChar();
+		  faultTotal();
+
+		  if(packState == 1 && lastPackState != 1){
+			  if(packUnbalanced == 1){
+				  chargingMode();
+			  }
+			  else{
+				  AD7280A_CBOffAll();
+			  }
+		  }
+		  else if(packState == 1 && lastPackState == 1){
+			  if(packUnbalanced == 0 && lastPackUnbalanced == 1 && CBChange == 1){
+				  AD7280A_CBOffAll();
+			  }
+			  else if(packUnbalanced == 1 && lastPackUnbalanced == 0){
+				  chargingMode();
+			  }
+			  else if(packUnbalanced == 1 && lastPackUnbalanced == 1){
+			 	  chargingMode();
+			 }
+		  }
+		  else if(packState == 0 && lastPackState == 1){
+			  AD7280A_CBOffAll();
+		  }
+
+		  filterTemp();
+		  filterVoltage();
+
+		  DataAvgVoltage();
+		  SendCANBMS();
+
+//		  printCurrentData();
+		  printCVData();
+		  printTemp();
+
+		          switch(print_sequence) {
+		              case 0:
+		                  printCurrentData_DMA(); // Siklus ke-1: Cetak Arus
+		                  print_sequence = 1;
+		                  break;
+
+//		              case 1:
+//		                  printCVData_DMA();      // Siklus ke-2: Cetak Tegangan
+//		                  print_sequence = 2;
+//		                  break;
+//
+//		              case 2:
+//		                  printTempData_DMA();        // Siklus ke-3: Cetak Suhu
+//		                  print_sequence = 0;     // Kembali ke awal
+//		                  break;
+
+		              default:
+		                  print_sequence = 0;
+		                  break;
+		          }
+
+
+
+		  HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
+
+//		  if(packState == 1){
+//
+//		  }
+//		  else if(packState == 2){
+//
+//		  }
+//		  else{
+//
+//		  }
+
+		  lastPackState = packState;
+		  startUp = 0;
+		  fault0 = fault1;
+
+		  if(startUp == 0 && packState != 0){
+
+		  }
+
+	  }
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+  }
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 168;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 4;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USER CODE BEGIN 4 */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) //Callback RX for FIFO0 (CAN1)
+{
+	if(hcan->Instance == CAN1)
+	{
+
+	CAN_RxHeaderTypeDef rxHeader;
+	uint8_t rxData[8];
+
+	// Read the received message
+	if(HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK)
+	{
+
+	  if (rxHeader.IDE == CAN_ID_STD){
+			//Standard ID Received (From TSEB)
+			if(rxHeader.StdId >= 18 && rxHeader.StdId <= 41)
+			{
+				uint8_t index = rxHeader.StdId - 18;
+				for (int i = 0; i < rxHeader.DLC; i++)
+				{
+					tempData[index][i] = (char)rxData[i];
+					tempDataInt[index][i] = rxData[i];
+				}
+			}
+		}
+	}
+}
+}
+
+void HAL_CAN_RxFifo1MsgPendingCallback(CAN_HandleTypeDef *hcan) //Callback RX for FIFO1 (CAN1)
+{
+	if(hcan->Instance == CAN2){
+
+		CAN_RxHeaderTypeDef rxHeader;
+		uint8_t rxData[8];
+
+		if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO1, &rxHeader, rxData) == HAL_OK)
+		{
+			if(rxHeader.IDE == CAN_ID_STD){
+
+				//Standard ID Received from VCU
+				if(rxHeader.StdId == 0x03){
+					if(rxData[0] == 0x06){
+						send_current_data = 1;		//flag to send current
+						tx_time = rxData[1];
+
+						receive_current_vcu[0] = rxData[0];
+						receive_current_vcu[1] = tx_time;
+					}
+					if(rxData[0] == 0x07){
+						send_temp_data = 1;			//flag to send avg temp
+						send_tempB_data = 1;
+						tx_time1 = rxData[1];
+						tx_time5 = rxData[1] + 14;
+
+						receive_temp_vcu[0] = rxData[0];
+						receive_temp_vcu[1] = tx_time1;
+					}
+//					if(rxData[0] == 0x08){          //0x08 A & 0x09 B
+//						send_avgvoltage_data = 1;	//flag to send avg voltage
+//						tx_time2 = rxData[1];
+//
+//						receive_avgVoltageA_vcu[0] = rxData[0];
+//						receive_avgVoltageA_vcu[1] = tx_time2;
+//					}
+//					else if(rxData[0] == 0x10){		//0x10 A & 0x11 B
+//						send_minvoltage_data = 1;	//flag to send min & max voltage
+//						send_maxvoltage_data = 1;
+//						tx_time3 = rxData[1];
+//						tx_time4 = rxData[1] + 12;
+//
+//						receive_minmaxVoltageA_vcu[0] = rxData[0];
+//						receive_minmaxVoltageA_vcu[1] = tx_time3;
+//
+//					}
+					else if(rxData[0] == 0x12){		//0x12 A & 0x13 B
+						send_vtotal_data = 1;
+						tx_time6 = rxData[1];
+						receive_VtotalMV_vcu[0] = rxData[0];
+						receive_VtotalMV_vcu[1] = tx_time6;
+					}
+				}
+		}
+	}
+}
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart){
+	if (huart -> Instance == UART5){
+		dma_tx_ready = 1;
+	}
+}
+
+void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+	HAL_GPIO_WritePin(SPI1_CS_GPIO_Port, SPI1_CS_Pin, GPIO_PIN_SET);
+	SPI_TX = 1;
+	SPI_Ready = 1;
+}
+
+void HAL_SPI_RxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+	HAL_GPIO_WritePin(SPI1_CS_GPIO_Port, SPI1_CS_Pin, GPIO_PIN_SET);
+	SPI_RX = 1;
+	SPI_Ready = 1;
+}
+
+//void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
+//{
+//	HAL_GPIO_WritePin (SPI1_CS_GPIO_Port, SPI1_CS_Pin, GPIO_PIN_SET);
+//	SPI_TX = 1;
+//	SPI_RX = 1;
+//	SPI_Ready = 1;
+//}
+
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+//    if (hspi->Instance == SPI1)
+//    {
+        HAL_GPIO_WritePin(SPI1_CS_GPIO_Port, SPI1_CS_Pin, GPIO_PIN_SET);
+        SPI_TX = 1; SPI_RX = 1; SPI_Ready = 1;
+//    }
+
+//    if (hspi->Instance == SPI3)
+//    {
+//        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_SET);
+//
+//
+//        switch (ads_state)
+//        {
+//            case ADS_DUMMY:
+//                ads_tx[0] = MAN_1;
+//                ads_tx[1] = 0x0000;
+//                ads_state = ADS_CH0;
+//                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_RESET);
+//                HAL_SPI_TransmitReceive_DMA(&hspi3,(uint8_t*) ads_tx, (uint8_t*)ads_rx, 2);
+//                break;
+//
+//            case ADS_CH0:
+//                ads_raw_buffer[0] = ads_rx[1];
+//                ads_tx[0] = MAN_0;
+//                ads_tx[1] = 0x0000;
+//                ads_state = ADS_CH1;
+//                HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_RESET);
+//                HAL_SPI_TransmitReceive_DMA(&hspi3,(uint8_t*) ads_tx, (uint8_t*)ads_rx, 2);
+//                break;
+//
+//            case ADS_CH1:
+//                ads_raw_buffer[1] = ads_rx[1];
+//                ads_state    = ADS_IDLE;
+//                ads_complete = 1;
+//                break;
+//
+//            default:
+//                ads_state = ADS_IDLE;
+//                break;
+//        }
+//    }
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if(htim->Instance == TIM3)
+  {
+  	//HAL_GPIO_TogglePin(LD4_GPIO_Port, LD4_Pin);
+	readBattery = 1;
+	telo2 = telo1;
+	telo1 = 0;
+  }
+  if(htim->Instance == TIM9)
+  {
+// 	 HAL_ADC_Start_IT(&hadc1);
+    	 //current[1] = 0;
+//	 current_calc();
+	 telo1++;
+	 //HAL_GPIO_TogglePin(LD6_GPIO_Port, LD6_Pin);
+  }
+}
+//
+//void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
+//{
+//  ADC_Val = HAL_ADC_GetValue(&hadc1);
+//  LPF_current_sensor();
+//  if(startUp ==0)
+//  	current_calc();
+//
+//  if(current[0] >= packCapacity*CTh)
+//    packState = 1;					//Pack in charging condition
+//  else if (current[0] <= -(packCapacity*CTh))
+//    packState = 2;					//Pack in discharging condition
+//  else
+//    packState = 0;					//Pack in dile condition
+//}
+
+//void LPF_current_sensor(void){
+//	out[0] = (in[0]*in[1]) + 2*in[1] + 1 / (((in[0]*in[0]) - (1.3072850288493234*in[1]) + 0.49181223722257528));
+//	in[2] = in[1];
+//	in[1] = in [0];
+//	out[2] = out[1];
+//	out[1] = out[0];
+//
+//	ADC_Filtered = out[0];
+//}
+
+//void current_calc(void){
+//
+//	current_tick = HAL_GetTick();
+//	if(current_tick >= previous_tick + default_interval){
+//		previous_tick = current_tick;
+//
+//		if(ADS_Read_All_Raw(&ads, ads_raw_buffer) == HAL_OK){
+//			//Convert Raw Value into Voltage (Raw / 65535) * 5.12V
+//			volt_ch0 = ((float)ads_raw_buffer[0] * 5.12f) / 65535.0f;
+//			volt_ch1 = ((float)ads_raw_buffer[1] * 5.12f) / 65535.0f;
+//
+//		diff_voltage = (volt_ch0 - volt_ch1) - dynamic_voltage_offset;
+//
+////		if(diff_voltage > -0.01f && diff_voltage < 0.01f){
+////			diff_voltage = 0.0f;
+////		}
+//
+//		current[0] = (-156.01 * diff_voltage) + 0.653; //Hasil Regresi Linear
+//
+//		if (current[0] > -0.3f && current[0] < 0.3f){
+//			current[0] = 0.0f;
+//		}
+//		}
+//	}
+//
+////	current[0] = (0.0181*adc1) - 362.17; //Linear regression current sensor with ads1115
+//
+//	if(current[0] <= discharge_current_limit || fully_discharged == 1)
+//	{
+//		DschCtrl = 0;
+//	}
+//	else {
+//		DschCtrl = 1;
+//	}
+//
+//	if(current[0] >= charge_current_limit || fully_charged == 1)
+//	{
+//		ChCtrl = 0;
+//	}
+//	else {
+//		ChCtrl = 1;
+//	}
+//
+//	current[1] = current[0];
+//}
+
+void current_calc(void){
+
+	current_tick = HAL_GetTick();
+	if(current_tick >= previous_tick + default_interval){
+		previous_tick = current_tick;
+
+		if(ADS_Read_All_Raw(&ads, ads_raw_buffer) == HAL_OK){
+			//Convert Raw Value into Voltage (Raw / 65535) * 5.12V
+			volt_ch0 = ((float)ads_raw_buffer[0] * 5.12f) / 65535.0f;
+			volt_ch1 = ((float)ads_raw_buffer[1] * 5.12f) / 65535.0f;
+
+		diff_voltage = (volt_ch0 - volt_ch1) - dynamic_voltage_offset;
+
+//		if(diff_voltage > -0.01f && diff_voltage < 0.01f){
+//			diff_voltage = 0.0f;
+//		}
+
+		current[0] = (-156.01 * diff_voltage) + 0.653; //Hasil Regresi Linear
+
+//		if (current[0] > -0.3f && current[0] < 0.3f){
+//			current[0] = 0.0f;
+//		}
+		}
+	}
+}
+
+//void Get_ADC_Value(void){
+//	HAL_ADC_Start(&hadc1);
+//	HAL_ADC_PollForConversion(&hadc1, 100);
+//	ADC_Val = HAL_ADC_GetValue(&hadc1);
+//
+//	LPF_current_sensor();
+//
+//	if(startUp == 0){
+//		current_calc();
+//	}
+//	if(current[0] >= packCapacity*CTh){
+//		packState = 1;
+//	}
+//	else if (current[0] <= -(packCapacity*CTh)){
+//		packState = 2;
+//	}
+//	else {
+//		packState = 0;
+//	}
+//
+//	if(packState != 0){
+//		//kalo mau naruh EEProm ntar disini
+//	}
+//
+//}
+
+//void ReadADS1115(void){
+//	adc1 = ADSreadADC_SingleEnded(&i2c, 0);
+//	millivolt = adc1*4.096*1000/32768;
+//
+//	itoa(millivolt, snum, 10);
+//}
+
+void chargingMode(void){
+	for(int i = 0; i < (BATTERY_SERIES_CON/6); i++)
+	{
+		for(int j=0; j<6; j++){
+		if(CB[i][j] == 1)
+			AD7280A_CBxTim(i*6+j);
+	}
+		AD7280A_CBOutAll(i);
+	}
+}
+
+void calcVtotal (void){
+	for(int i = 0; i<BATTERY_SERIES_CON; i++)
+	{
+		Vtotal += cellVoltage[i];
+	}
+
+	Vtotal = Vtotal/1000;
+}
+
+void calcVtotalMV (void){
+	VtotalMV = 0;
+	for(int i = 0; i<48; i++){
+		if(cellVoltage[i] >= 4990){
+					cellVoltage[i] = cellVoltage[9];
+				}
+
+				else if(cellVoltage[i] <= 999){
+					cellVoltage[i] = cellVoltage[14];
+				}
+		VtotalMV += cellVoltage[i];
+			}
+	}
+
+void calcVBatCond(void){
+	Vmin = 0;
+	Vmax = 5000;
+	Vavg = 0;
+
+	for(int i = 0;i < BATTERY_SERIES_CON;i++){
+		if(cellVoltage[i] < Vmin)
+			Vmin = cellVoltage[i];
+		if(cellVoltage[i] > Vmax)
+			Vmax = cellVoltage[i];
+	}
+
+	if(Vmin <= Vlow)
+		fully_discharged = 1;
+	else if (Vmin + (Vmin*Vth) > Vlow)
+		fully_discharged = 0;
+
+	if(Vmax >= Vhigh)
+		fully_charged = 1;
+	else if(Vmax - (Vmax*Vth) < Vhigh)
+		fully_charged = 0;
+
+	for(int i = 0; i<BATTERY_SERIES_CON; i++){
+		Vavg = Vavg + cellVoltage[i];
+	}
+		Vavg = Vavg / BATTERY_SERIES_CON;
+		Vtresh = Vavg + (Vavg*Vth);
+		CBChange = 0;
+
+	for (int i = 0; i < (BATTERY_SERIES_CON/6);i++){
+		for(int j=0; j<6; j++){
+			lastCB[i][j] = CB[i][j];
+
+			if(CB[i][j] == 0){
+				if(cellVoltage[i*6+j] >= Vtresh)
+				CB[i][j] = 1;
+				else
+					CB[i][j] = 0;
+			}
+
+			else if(CB[i][j] == 1 && packState == 1)
+			{
+				if(cellVoltage[i*6+j] + 0.13 >= Vtresh)
+					CB[i][j] = 1;
+				else
+					CB[i][j] = 0;
+			}
+
+			else if (CB[i][j] == 1 && packState == 0)
+			{
+				if(cellVoltage[i*6+j] >= Vtresh)
+					CB[i][j] = 1;
+				else
+					CB[i][j] = 0;
+			}
+
+			Cell_balancer[i*6+j] = CB [i][j];
+
+			if(lastCB[i][j] != CB[i][j])
+				CBChange = CBChange | 1;
+			else
+				CBChange = CBChange | 0;
+		}
+	}
+
+	lastPackUnbalanced = packUnbalanced;
+	packUnbalanced = 0;
+	for (int i = 0; i<BATTERY_SERIES_CON; i++){
+		for(int j = 0; j<6; j++){
+			packUnbalanced = (CB[i][j] | packUnbalanced ? 1 : 0);
+		}
+	}
+
+}
+
+void calcUV(void){
+	uv_stat = 0;
+	DisCtrl = 0;
+
+	for(int i=0; i<BATTERY_SERIES_CON; i++)
+	{
+		if(cellVoltage[i] <= Vlow)
+		{
+			DisCtrl = DisCtrl | 1;
+			uv_stat = uv_stat | 1;
+		}
+		else {
+			DisCtrl = DisCtrl | 0;
+			uv_stat = uv_stat | 0;
+		}
+	}
+
+	if(uv_stat == 1){
+		HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_RESET);
+	}
+	else{
+		HAL_GPIO_WritePin(LD4_GPIO_Port, LD4_Pin, GPIO_PIN_SET);
+	}
+
+	if(uv_stat == 0)
+	{
+		for(int i = 0; i<BATTERY_SERIES_CON; i++)
+		{
+			if(cellVoltage[i] > Vth_low)
+			{
+//				eepromUV = eepromUV | 0;
+//				eepromUV = 0;
+			}
+			else {
+//				eepromUV = eepromUV | 1;
+//				eepromUV = 1
+			}
+		}
+	}
+	else if(uv_stat == 1)
+	{
+//		eepromUV = 1;
+	}
+	else if(uv_stat == 0)
+	{
+//		eepromUV = 0;
+	}
+}
+
+void calcOV (void){
+	ov_stat = 0;
+	CharCtrl = 0;
+	for(int i = 0; i<BATTERY_SERIES_CON;i++)
+	{
+		if(cellVoltage[i] >= Vhigh)
+		{
+			CharCtrl = CharCtrl | 1;
+			ov_stat = ov_stat | 1;
+		}
+		else {
+			CharCtrl = CharCtrl | 0;
+			ov_stat = ov_stat | 0;
+		}
+	}
+	if(ov_stat == 1) {
+		HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+	}
+	else {
+		HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
+	}
+
+	if(ov_stat == 0) {
+		for(int i = 0; i < BATTERY_SERIES_CON; i++)
+		{
+			if (cellVoltage[i] < Vth_high)
+			{
+//				eepromOV = 0;
+//				eepromOV = eepromOV | 0;
+			}
+			else {
+//				eepromOV = 1;
+//				eepromOV = eepromOV | 1;
+			}
+	}
+}
+	else if(ov_stat == 1){
+//		eepromOV = 1;
+	}
+	else if(ov_stat == 0){
+//		eepromOV = 0;
+	}
+}
+
+void faultDet(void){
+	fault1 = 0;
+//	if(packState == 0){
+//		fault1 = 0;
+//	}
+//	else if(packState == 1){
+//		if(ov_stat == 1)
+//		{
+//			fault1 = 1;
+//		}
+//		else {
+//			fault1 = 0;
+//		}
+//	}
+//	else if(packState == 2){
+//		if(uv_stat == 1)
+//		{
+//			fault1 = 1;
+//		}
+//		else {
+//			fault1 = 0;
+//		}
+//	}
+	if(ov_stat == 1 || uv_stat == 1){
+			fault1 = 1;
+		}
+		else {
+			fault1 = 0;
+		}
+}
+
+void faultTotal(void){
+	if(fault1 == 1 && fault0 == 1){
+		faultall++;
+		if(faultall >= consecutiveCount){
+			HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_RESET);
+		}
+	}
+	else {
+		HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_SET);
+		faultall = 0;
+	}
+}
+
+void filterVoltage(void){
+
+	//Loop for each module for each interface (4 module each interface)
+	for(int group = 0; group < 4; group++){
+		int startIdx = group * 12;  //Series each module : 0-12, 12-24, 24-36, 36-48
+		int endIdx = startIdx + 12;	//End the series at multiple of 12
+
+		float minVal = cellVoltage[startIdx];
+		float maxVal = cellVoltage[startIdx];
+		float sum = 0;
+
+		//Loop for read voltage of 12 series in each module
+		for(int i = startIdx; i < endIdx; i++){
+			float val = cellVoltage[i];
+			if(val < minVal)
+				minVal = val;
+			if(val > maxVal)
+				maxVal = val;
+			sum += val;
+		}
+
+		minVoltage[group] = minVal;
+		maxVoltage[group] = maxVal;
+		avgVoltage[group] = sum / 12.0f;
+	}
+}
+
+void filterTemp(void){
+	//Loop for 8 module
+	for(int i = 0; i < 8; i++){
+//		float minTemp = 0;
+
+//		float maxTemp = 0;
+//		float sum = 0;
+
+		int startRow = i * 3;		//Total temp data per module is 24
+		int endRow = startRow + 3;
+
+		int minVal = tempDataInt[startRow][0];
+		int maxVal = tempDataInt[startRow][0];
+		int sum = 0;
+
+		//Loop for 24 data in each module
+		for(int j = startRow; j < endRow; j++){
+			for (int k = 0; k < 8; k++){
+				int val = tempDataInt[j][k];
+
+				if(val < minVal)
+					minVal = val;
+				if(val > maxVal)
+					maxVal = val;
+				sum += val;
+			}
+		}
+
+		tempMin[i] = minVal;
+		tempMax[i] = maxVal;
+		avgTemp[i] = sum / 24.0f;
+	}
+}
+
+
+uint8_t CANTransmitTemp(void){
+	uint8_t avgTempData[5];
+	avgTempData[0] = 0x07;
+	for (int i=1; i < 5; i++){
+		avgTempData[i] = (uint8_t)((int)fabs(avgTemp[i]));
+	}
+	CAN_TxHeaderTypeDef TxHeader;
+	uint32_t TxMailbox;
+
+	TxHeader.StdId = 0x12;
+	TxHeader.ExtId = 0;
+	TxHeader.IDE = CAN_ID_STD;
+	TxHeader.RTR = CAN_RTR_DATA;
+	TxHeader.DLC = 8;
+
+	//CAN Transmit for Average Temp each module
+//	HAL_CAN_AddTxMessage(&hcan2, &TxHeader, avgTempData, &TxMailbox);
+	if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan2) == 0) {
+
+	return 0;
+	}
+
+	if (HAL_CAN_AddTxMessage(&hcan2, &TxHeader, avgTempData, &TxMailbox) == HAL_OK) {
+
+	return 1;
+	}
+
+	return 0;
+}
+
+
+uint8_t CANTransmitTempB(void){
+	uint8_t avgTempDataB[5];
+	avgTempDataB[0] = 0x08;
+
+	for (int i=1; i < 5; i++){
+		avgTempDataB[i] = (uint8_t)((int)fabs(avgTemp[i+4]));
+	}
+	CAN_TxHeaderTypeDef TxHeader;
+	uint32_t TxMailbox;
+
+	TxHeader.StdId = 0x12;
+	TxHeader.ExtId = 0;
+	TxHeader.IDE = CAN_ID_STD;
+	TxHeader.RTR = CAN_RTR_DATA;
+	TxHeader.DLC = 5;
+
+//	HAL_CAN_AddTxMessage(&hcan2, &TxHeader, avgTempDataB, &TxMailbox);
+
+	if (HAL_CAN_AddTxMessage(&hcan2, &TxHeader, avgTempDataB, &TxMailbox) == HAL_OK) {
+
+	return 1;
+	}
+
+	return 0;
+}
+
+//void DataMinVoltage(void){
+////	uint8_t MinVoltageData[5];
+//	MinVoltageData[0] = 0x11;		//0x11 for A, 0x13 for B
+//
+//	for(int i=1; i < 5; i++){
+//		MinVoltageData[i] = (uint8_t)((int)fabs(minVoltage[i])/100);
+//	}
+//}
+
+//uint8_t CANTransmitMinVoltage(void){
+//	uint8_t MinVoltageData[5];
+//	MinVoltageData[0] = 0x11;		//0x11 for A, 0x13 for B
+//
+//	for(int i=0; i < 4; i++){
+//		MinVoltageData[i+1] = (uint8_t)((int)fabs(minVoltage[i])/100);
+//	}
+//	CAN_TxHeaderTypeDef TxHeader;
+//	uint32_t TxMailbox;
+//
+//	TxHeader.StdId = 0x12;
+//	TxHeader.ExtId = 0;
+//	TxHeader.IDE = CAN_ID_STD;
+//	TxHeader.RTR = CAN_RTR_DATA;
+//	TxHeader.DLC = 5;
+//
+//	//CAN Transmit for Min.Voltage per module
+////	HAL_CAN_AddTxMessage(&hcan2, &TxHeader, MinVoltageData, &TxMailbox);
+//
+//	if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan2) == 0) {
+//
+//	return 0;
+//	}
+//
+//	if (HAL_CAN_AddTxMessage(&hcan2, &TxHeader, MinVoltageData, &TxMailbox) == HAL_OK) {
+//
+//	return 1;
+//	}
+//
+//	return 0;
+//
+//}
+
+//void DataMaxVoltage(void){
+////	uint8_t MaxVoltageData[5];
+//	MaxVoltageData[0] = 0x12;	//0x12 for A, 0x14 for B
+//
+//	for (int i = 1; i < 5; i++){
+//
+//	MaxVoltageData[i] = (uint8_t)((int)fabs(maxVoltage[i])/100);
+//	}
+//}
+
+//uint8_t CANTransmitMaxVoltage(void){
+//	uint8_t MaxVoltageData[5];
+//	MaxVoltageData[0] = 0x12;	//0x12 for A, 0x14 for B
+//
+//	for (int i = 0; i < 4; i++){
+//
+//	MaxVoltageData[i+1] = (uint8_t)((int)fabs(maxVoltage[i])/100);
+//}
+//	CAN_TxHeaderTypeDef TxHeader;
+//	uint32_t TxMailbox;
+//
+//	TxHeader.StdId = 0x12;
+//	TxHeader.ExtId = 0;
+//	TxHeader.IDE = CAN_ID_STD;
+//	TxHeader.RTR = CAN_RTR_DATA;
+//	TxHeader.DLC = 5;
+//
+//	//CAN Transmit for Min.Voltage and Max.Voltage per module
+////	HAL_CAN_AddTxMessage(&hcan2, &TxHeader, MaxVoltageData, &TxMailbox);
+//	if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan2) == 0) {
+//		return 0;
+//		}
+//
+//	if (HAL_CAN_AddTxMessage(&hcan2, &TxHeader, MaxVoltageData, &TxMailbox) == HAL_OK) {
+//		return 1;
+//		}
+//
+//		return 0;
+//}
+
+//void DataAvgVoltage(void){
+//	//Average Voltage Data Each Module
+////	uint8_t AvgVoltageData[5];
+//	AvgVoltageData[0] = 0x09;		//0x09 for A, 0x10 for B
+////	char strNumberAvg[20];
+//	for(int i = 0; i < 4; i++){
+////		int avgVoltageInt = (int)fabs(avgVoltage[i]);
+////		uint8_t avgVoltageTransmit = avgVoltageInt / 100;
+////		char firstTwoDigitsAvg[3];
+////		sprintf(strNumberAvg, "%.0f", fabs(avgVoltage[i]));
+////		strncpy(firstTwoDigitsAvg, strNumberAvg, 2);
+////		firstTwoDigitsAvg[2] = '\0';
+////		AvgVoltageData[i+1] = avgVoltageTransmit;
+//		AvgVoltageData[i+1] = (uint8_t)((int)fabs(avgVoltage[i])/100);
+//	}
+//}
+
+//uint8_t CANTransmitAvgVoltage(void){
+//
+//	CAN_TxHeaderTypeDef TxHeader;
+//	uint32_t TxMailbox;
+//
+//	TxHeader.StdId = 0x12;
+//	TxHeader.ExtId = 0;
+//	TxHeader.IDE = CAN_ID_STD;
+//	TxHeader.RTR = CAN_RTR_DATA;
+//	TxHeader.DLC = 5;
+//
+//	//CAN Transmit for average voltage per module
+////	HAL_CAN_AddTxMessage(&hcan2, &TxHeader, AvgVoltageData, &TxMailbox);
+//	if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan2) == 0) {
+//
+//	return 0;
+//
+//	}
+//
+//	if (HAL_CAN_AddTxMessage(&hcan2, &TxHeader, AvgVoltageData, &TxMailbox) == HAL_OK) {
+//
+//	return 1;
+//
+//	}
+//
+//	return 0;
+//}
+
+uint8_t CANTransmitVtotalMV(void){
+//Parsing karena data baca 4000 as a 4V
+    uint32_t VtotalRaw = VtotalMV;
+
+    VtotalData[0] = 0x15;                               // 0x15 A & 0x16 B
+    VtotalData[1] = (uint8_t)(VtotalRaw >> 24);         // Byte1 MSB
+    VtotalData[2] = (uint8_t)(VtotalRaw >> 16);         // Byte2
+    VtotalData[3] = (uint8_t)(VtotalRaw >> 8);          // Byte3
+    VtotalData[4] = (uint8_t)(VtotalRaw & 0xFF);        // Byte4 LSB
+
+	CAN_TxHeaderTypeDef TxHeader;
+	uint32_t TxMailbox;
+
+	TxHeader.StdId = 0x12;
+	TxHeader.ExtId = 0;
+	TxHeader.IDE = CAN_ID_STD;
+	TxHeader.RTR = CAN_RTR_DATA;
+	TxHeader.DLC = 5;
+
+    if(HAL_CAN_GetTxMailboxesFreeLevel(&hcan2) == 0){
+        return 0;
+    }
+
+    if(HAL_CAN_AddTxMessage(&hcan2, &TxHeader, VtotalData, &TxMailbox) == HAL_OK){
+        return 1;
+    }
+
+    return 0;
+}
+
+uint8_t CANTransmitCurrent(void){
+//	char strNumber[20];				//Buffer to hold the converted float as a string
+//	float currentC = current[0];
+//
+//	// I. Convert float to string with no decimal places
+//	sprintf (strNumber, "%.0f", fabs(currentC));
+
+	// II. Extract the integer part (before the decimal)
+	uint16_t currentCAN = (uint16_t)(fabs(current[0]) * 10.0f);
+
+
+	// III. Extract tens and ones place
+	uint8_t currentfirstByte = (uint8_t)(currentCAN >> 8);	  //MSB
+	uint8_t currentsecondByte = (uint8_t)(currentCAN & 0xFF); //LSB
+
+	CurrentData[0] = 0x06;
+	CurrentData[1] = currentfirstByte;
+	CurrentData[2] = currentsecondByte;
+	CAN_TxHeaderTypeDef TxHeader;
+	uint32_t TxMailbox;
+
+	TxHeader.StdId = 0x12;
+	TxHeader.ExtId = 0;
+	TxHeader.IDE = CAN_ID_STD;
+	TxHeader.RTR = CAN_RTR_DATA;
+	TxHeader.DLC = 3;
+
+
+	//CAN Transmit for the Current Data
+//	HAL_CAN_AddTxMessage(&hcan2, &TxHeader, CurrentData, &TxMailbox);
+	if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan2) == 0) {
+
+	return 0;
+
+	}
+
+
+
+	if (HAL_CAN_AddTxMessage(&hcan2, &TxHeader, CurrentData, &TxMailbox) == HAL_OK) {
+
+	return 1;
+
+	}
+
+
+
+	return 0;
+}
+
+
+void printCurrentData_DMA(void) {
+    // Pastikan DMA siap dan hardware UART tidak sibuk
+    if (dma_tx_ready && huart5.gState == HAL_UART_STATE_READY) {
+        dma_tx_ready = 0; // Kunci flag DMA
+
+        // Format string langsung ke dalam dma_tx_buffer
+        // snprintf akan mengembalikan jumlah karakter yang berhasil ditulis
+        int16_t len = snprintf(dma_tx_buffer, UART_TX_BUF_SIZE, "Current: %.2f A\r\n", current[1]);
+
+        // Jika konversi berhasil, eksekusi transmisi DMA
+        if (len > 0) {
+            if (HAL_UART_Transmit_DMA(&huart5, (uint8_t*)dma_tx_buffer, len) != HAL_OK) {
+                dma_tx_ready = 1; // Buka kunci jika hardware gagal inisialisasi
+            }
+        } else {
+            dma_tx_ready = 1; // Buka kunci jika terjadi error pada snprintf
+        }
+    }
+}
+
+void printCVData_DMA(void) {
+    // Jalankan hanya jika DMA siap dan hardware UART tidak sibuk
+    if (dma_tx_ready && huart5.gState == HAL_UART_STATE_READY) {
+        dma_tx_ready = 0; // Kunci DMA
+
+        int16_t len = 0;
+        int16_t max_size = UART_TX_BUF_SIZE;
+
+        // --- VOLTAGE BLOCK I ---
+        len += snprintf(dma_tx_buffer + len, max_size - len, "VOLTAGE --- I \n");
+        for(int i = 0; i < 12; i++) {
+            len += snprintf(dma_tx_buffer + len, max_size - len, "@%.0f,", cellVoltage[i]);
+            if(i > 1 && (i+1)%6 == 0) {
+                len += snprintf(dma_tx_buffer + len, max_size - len, "@");
+            }
+        }
+
+        // --- VOLTAGE BLOCK II ---
+        len += snprintf(dma_tx_buffer + len, max_size - len, "\nVOLTAGE --- II \n");
+        for(int i = 12; i < 24; i++) {
+            len += snprintf(dma_tx_buffer + len, max_size - len, "@%.0f,", cellVoltage[i]);
+            if(i > 1 && (i+1)%6 == 0) {
+                len += snprintf(dma_tx_buffer + len, max_size - len, "@");
+            }
+        }
+
+        // --- VOLTAGE BLOCK III ---
+        len += snprintf(dma_tx_buffer + len, max_size - len, "\nVOLTAGE --- III \n");
+        for(int i = 24; i < 36; i++) {
+            len += snprintf(dma_tx_buffer + len, max_size - len, "@%.0f,", cellVoltage[i]);
+            if(i > 1 && (i+1)%6 == 0) {
+                len += snprintf(dma_tx_buffer + len, max_size - len, "@");
+            }
+        }
+
+        // --- VOLTAGE BLOCK IV ---
+        len += snprintf(dma_tx_buffer + len, max_size - len, "\nVOLTAGE --- IV \n");
+        for(int i = 36; i < 48; i++) {
+            len += snprintf(dma_tx_buffer + len, max_size - len, "@%.0f,", cellVoltage[i]);
+            if(i > 1 && (i+1)%6 == 0) {
+                len += snprintf(dma_tx_buffer + len, max_size - len, "@");
+            }
+        }
+
+        len += snprintf(dma_tx_buffer + len, max_size - len, "#\n\r");
+
+        // Kirim seluruh string data tegangan sekaligus lewat DMA
+        if (len > 0) {
+            if (HAL_UART_Transmit_DMA(&huart5, (uint8_t*)dma_tx_buffer, len) != HAL_OK) {
+                dma_tx_ready = 1;
+            }
+        } else {
+            dma_tx_ready = 1;
+        }
+    }
+}
+
+void printTempData_DMA(void) {
+    if (dma_tx_ready && huart5.gState == HAL_UART_STATE_READY) {
+        dma_tx_ready = 0; // Kunci DMA
+
+        int16_t len = 0;
+        int16_t max_size = UART_TX_BUF_SIZE;
+        const char* labels[] = {"1A", "2A", "3A", "4A", "1B", "2B", "3B", "4B"};
+
+        // Loop untuk 8 modul suhu (1A sampai 4B)
+        for (int m = 0; m < 8; m++) {
+            len += snprintf(dma_tx_buffer + len, max_size - len, "TEMP DATA --- %s \n", labels[m]);
+
+            int startRow = m * 3;
+            int endRow = startRow + 3;
+
+            for (int i = startRow; i < endRow; i++) {
+                for (int j = 0; j < 8; j++) {
+                    // Menggunakan matriks tempData tunggal hasil optimasi sebelumnya
+                    len += snprintf(dma_tx_buffer + len, max_size - len, "%d - ", tempData[i][j]);
+                }
+            }
+            len += snprintf(dma_tx_buffer + len, max_size - len, "\n--\n");
+        }
+
+        len += snprintf(dma_tx_buffer + len, max_size - len, "#\n\r");
+
+        // Kirim seluruh string data suhu sekaligus lewat DMA
+        if (len > 0) {
+            if (HAL_UART_Transmit_DMA(&huart5, (uint8_t*)dma_tx_buffer, len) != HAL_OK) {
+                dma_tx_ready = 1;
+            }
+        } else {
+            dma_tx_ready = 1;
+        }
+    }
+}
+
+void printCurrentData(void){
+	printf("Current : %.2f", current[1]);
+//	sprintf(textBuf + strlen(textBuf), "Current:%.2f,", current[1]);
+	printf("\n");
+}
+
+void printCVData(void){
+//	printf("%.2f", current[1]);
+//	sprintf(textBuf + strlen(textBuf), "Current:%.2f,", current[1]);
+//	printf("\n");
+
+	printf ("VOLTAGE --- I \n");
+	for(int i = 0; i < 12; i++){
+		printf("@%.0f,", cellVoltage[i]);
+//		sprintf(textBuf, "%.0f", cellVoltage[i]);
+		if(i > 1 && (i+1)%6 == 0){
+			printf("@");
+		}
+	}
+	printf("\n");
+	printf ("VOLTAGE --- II \n");
+	for(int i = 12; i < 24; i++){
+		printf("@%.0f,", cellVoltage[i]);
+//		sprintf(textBuf, "%.0f", cellVoltage[i]);
+		if(i > 1 && (i+1)%6 == 0){
+			printf("@");
+		}
+	}
+	printf("\n");
+	printf ("VOLTAGE --- III \n");
+	for(int i = 24; i < 36; i++){
+		printf("@%.0f,", cellVoltage[i]);
+//		sprintf(textBuf, "%.0f", cellVoltage[i]);
+		if(i > 1 && (i+1)%6 == 0){
+			printf("@");
+		}
+	}
+	printf("\n");
+	printf ("VOLTAGE --- IV \n");
+	for(int i = 36; i < 48; i++){
+		 printf("@%.0f,", cellVoltage[i]);
+//		 sprintf(textBuf, "%.0f,",cellVoltage[i]);
+		 if(i > 1 && (i+1)%6 == 0){
+		 printf("@");
+		}
+	}
+
+	printf("#\n\r");
+}
+
+void printTemp(void){
+	printf("TEMP DATA --- 1A \n");
+	for (int i = 0; i < 3; i++){
+		for (int j = 0 ; j < 8; j++){
+			printf ("%d ", tempData[i][j]);
+			printf ("-");
+		}
+	}
+
+	printf("\n");
+	printf("--");
+	printf("TEMP DATA --- 2A \n");
+	for (int i = 3; i < 6; i++){
+		for (int j = 0 ; j < 8; j++){
+			printf ("%d ", tempData[i][j]);
+			printf ("-");
+		}
+	}
+
+	printf("\n");
+	printf("--");
+	printf("TEMP DATA --- 3A \n");
+	for (int i = 6; i < 9; i++){
+		for (int j = 0 ; j < 8; j++){
+			printf ("%d ", tempData[i][j]);
+			printf ("-");
+		}
+	}
+
+	printf("\n");
+	printf("--");
+	printf("TEMP DATA --- 4A \n");
+	for (int i = 9; i < 12; i++){
+		for (int j = 0 ; j < 8; j++){
+			printf ("%d ", tempData[i][j]);
+			printf ("-");
+		}
+	}
+
+	printf("\n");
+	printf("--");
+	printf("TEMP DATA --- 1B \n");
+	for (int i = 12; i < 15; i++){
+		for (int j = 0 ; j < 8; j++){
+			printf ("%d ", tempData[i][j]);
+			printf ("-");
+		}
+	}
+
+	printf("\n");
+	printf("--");
+	printf("TEMP DATA --- 2B \n");
+	for (int i = 15; i < 18; i++){
+		for (int j = 0 ; j < 8; j++){
+			printf ("%d ", tempData[i][j]);
+			printf ("-");
+		}
+	}
+
+	printf("\n");
+	printf("--");
+	printf("TEMP DATA --- 3B \n");
+	for (int i = 18; i < 21; i++){
+		for (int j = 0 ; j < 8; j++){
+			printf ("%d ", tempData[i][j]);
+			printf ("-");
+		}
+	}
+
+	printf("\n");
+	printf("--");
+	printf("TEMP DATA --- 4B \n");
+	for (int i = 21; i < 24; i++){
+		for (int j = 0 ; j < 8; j++){
+			printf ("%d ", tempData[i][j]);
+			printf ("-");
+		}
+	}
+
+	printf("#\n\r");
+}
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
