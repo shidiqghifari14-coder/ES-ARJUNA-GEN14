@@ -233,6 +233,8 @@ void calcVtotalMV(void); //BARUU
 void calcVBatCond(void);
 void faultDet(void);
 void faultTotal(void);
+void TotalTempAfunc(void);
+void TotalTempBfunc(void);
 //void DataCurrent(void);
 //void DataTempA(void);
 //void DataTempB(void);
@@ -585,7 +587,7 @@ int main(void)
 		  calcVtotal();
 		  calcVtotalMV();
 		  current_calc();
-          if (send_current_data == 1 && HAL_GetTick() - last1 >= 30) {
+          if (send_current_data == 1 && HAL_GetTick() - last1 >= 20) {
 
               if (CANTransmitCurrent()) {
 
@@ -626,8 +628,10 @@ int main(void)
 
 		  filterTemp();
 		  filterVoltage();
+		  TotalTempAfunc();
+		  TotalTempBfunc();
 
-		  DataAvgVoltage();
+//		  DataAvgVoltage();
 		  SendCANBMS();
 
 //		  printCurrentData();
@@ -1066,6 +1070,22 @@ void calcVtotalMV (void){
 			}
 	}
 
+void TotalTempAfunc (void){
+	TotalTempA = 0;
+	for (int i=1; i < 5; i++){
+	  avgTempData[i] = (uint8_t)((int)fabs(avgTemp[i]));
+	}
+	TotalTempA = avgTempData[1] + avgTempData[2] + avgTempData[3] + avgTempData[4];
+}
+
+void TotalTempBfunc (void){
+	TotalTempB = 0;
+	for (int i=1; i < 5; i++){
+		avgTempDataB[i] = (uint8_t)((int)fabs(avgTemp[i+4]));
+	}
+	TotalTempB = avgTempDataB[1] + avgTempDataB[2] + avgTempDataB[3] + avgTempDataB[4];
+}
+
 void calcVBatCond(void){
 	Vmin = 0;
 	Vmax = 5000;
@@ -1342,11 +1362,7 @@ void filterTemp(void){
 
 uint8_t CANTransmitTemp(void){
 	TempA[0] = 0x07;
-	for (int i=1; i < 5; i++){
-		avgTempData[i] = (uint8_t)((int)fabs(avgTemp[i]));
-	}
-	TotalTempA = avgTempData[1] + avgTempData[2] + avgTempData[3] + avgTempData[4];
-	TempB[1] = TotalTempA;
+	TempA[1] = TotalTempA;
 	CAN_TxHeaderTypeDef TxHeader;
 	uint32_t TxMailbox;
 
@@ -1374,11 +1390,6 @@ uint8_t CANTransmitTemp(void){
 
 uint8_t CANTransmitTempB(void){
 	TempB[0] = 0x08;
-
-	for (int i=1; i < 5; i++){
-		avgTempDataB[i] = (uint8_t)((int)fabs(avgTemp[i+4]));
-	}
-	TotalTempB = avgTempDataB[1] + avgTempDataB[2] + avgTempDataB[3] + avgTempDataB[4];
 	TempB[1] = TotalTempB;
 	CAN_TxHeaderTypeDef TxHeader;
 	uint32_t TxMailbox;
