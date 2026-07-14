@@ -1061,7 +1061,7 @@ void calcVtotal (void){
 
 void calcVtotalMV (void){
 	VtotalMV = 0;
-	for(int i = 0; i<24; i++){
+	for(int i = 23; i<48; i++){
 		VtotalMV += cellVoltage[i];
 			}
 	VtotalMV = VtotalMV*2;
